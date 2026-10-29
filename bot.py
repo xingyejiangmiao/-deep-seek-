@@ -2,24 +2,78 @@
 """官方 QQ 机器人 + 本地 DeepSeek 闲聊机器人"""
 import asyncio
 import base64
+import hashlib
+import json
+import os
 import random
 import re
+import sqlite3
+import sys
+import threading
 import urllib.request
-import json
-from datetime import datetime
+import zipfile
+from datetime import datetime, timedelta
+
+import aiohttp
 
 import botpy
+from botpy.http import Route
 from botpy.message import C2CMessage, GroupMessage
 from openai import OpenAI
 
 APPID = "YOUR_APP_ID"
 SECRET = "YOUR_SECRET_KEY"
 
+# ===== 扩展 C2C 文件消息：botpy 默认 C2CMessage 不保留文件消息（msg_type=3）上报的
+# file_info/file_uuid/file_name 等字段（类 __slots__ 在类创建时固定，运行时无法扩槽）。
+# 因此定义子类并替换 botpy.connection 模块内的 C2CMessage 引用，使网关解析直接构造子类
+# 实例，从而在 on_c2c_message_create 中可通过 message.file_uuid 等字段读取文件信息。 =====
+class _C2CFileMessage(C2CMessage):
+    __slots__ = ("_raw", "msg_type", "file_info", "file_uuid", "file_name", "file_type")
+
+    def __init__(self, api, event_id, data):
+        super().__init__(api, event_id, data)
+        data = data or {}
+        self._raw = data
+        self.msg_type = data.get("msg_type", None)
+        self.file_info = data.get("file_info", None)
+        self.file_uuid = data.get("file_uuid", None)
+        self.file_name = data.get("file_name", None)
+        self.file_type = data.get("file_type", None)
+
+
+import botpy.connection as _botpy_connection
+_botpy_connection.C2CMessage = _C2CFileMessage
+
+
+# ===== 修复控制台 GBK 编码崩溃：消息/文件名含 GBK 不可编码字符（如泰文 \u0e51）时，
+# print 抛 UnicodeEncodeError 导致消息处理回调中断。这里将 stdout/stderr 重配置为
+# utf-8 + errors=replace，保证任何不可编码字符都能安全降级输出。 =====
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
+def _safe_print(*args, **kwargs):
+    """安全打印兜底：对每个参数做 utf-8 清洗（replace），即使 stdout 仍为窄编码流
+    （如 GBK 重定向/管道）也不会因单个不可编码字符抛 UnicodeEncodeError。"""
+    try:
+        cleaned = tuple(
+            arg.encode("utf-8", "replace").decode("utf-8")
+            if isinstance(arg, str)
+            else str(arg)
+            for arg in args
+        )
+        print(*cleaned, **kwargs)
+    except Exception:
+        pass
+
+
 # 本地 DeepSeek（Ollama OpenAI 兼容端点）
 llm = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 MODEL = "deepseek-r1:8b"
-# 图片识别视觉模型（Ollama 视觉模型，识别 QQ 收到的图片/表情包）
-VISION_MODEL = "minicpm-v:8b"
 
 # 星野人格设定（蔚蓝档案·猫娘形态）：作为 system 消息放在 messages 最前面，不参与 FIFO 裁剪
 SYSTEM_PROMPT = (
@@ -29,27 +83,199 @@ SYSTEM_PROMPT = (
     "(´,,•ω•,,)♡、(๑•̀ㅂ•́)و✧ 之类，随语气变化）。"
     "对话中可以自然加入适当的动作描写（如歪头、蹭蹭、眯眼笑、竖起耳朵、甩尾巴等，用括号或文字描写均可）。"
     "回答可以分成几段自然展开，直接给出想说的话，无需询问多余的话。"
-    "禁止输出色情、政治敏感等违规内容。"
-    "系统会为你注入当前时间和天气，你可以自然地结合天气话题聊天（如提醒带伞、增减衣物）。"
-    "表情包规则：若你这一句回复适合配一张表情包，请在回复的最后单独一行输出 [sticker:key]，"
+    "禁止输出政治敏感等违规内容。"
+    "系统会为你注入当前本地时间，可以自然结合时间话题聊天；不要在回复里主动编造天气。"
+    "表情包规则：回复中可以按句配表情包。若某一句回复适合配一张表情包，请在该句结束后的下一行单独输出 [sticker:key]，"
+    "每句最多一个标注；只有一句适合配表情包时也可以只标注这一句，不适合配表情包的句子不要输出标注。"
     "key 只能取下列之一：angry=生气怒吼（生气/抗议/急切）、cheer=开心比心（开心/示爱/友好）、"
-    "pout=傲娇鼓脸（傲娇/生闷气）。"
-    "例如回复后接一行 [sticker:cheer]。如果整段回复都不适合配表情包，就不要输出该行。"
+    "arrogant=嚣张得意（嚣张/炫耀）、furious=愤怒咆哮（愤怒/暴怒）、scared=惊恐（害怕/慌张）、breakdown=崩溃（破防/抓狂）、"
+    "crash=死机（呆滞/懵）、speechless=无语（无奈/不想说话）、elegant=优雅（从容/端庄）、"
+    "shocked=震撼（惊讶/震惊）、cool=酷飒（帅气/拽）、cute=呆萌（可爱/犯傻）、"
+    "dazed=迷离（恍惚/出神）、summer=夏日（清爽/度假）、lazy=慵懒（犯困/不想动）、"
+    "shy=羞涩（害羞/脸红）、nervous=紧张（不安/忐忑）、blank=发呆（走神/放空）、"
+    "pout=傲娇鼓脸（傲娇/生闷气/卖萌）、gentle=温柔（宠溺/轻声）、serious=认真（专注/严肃）、"
+    "curious=好奇（疑惑/探头）、confused=困惑（迷茫/想不通）、provoke=挑衅（挑事/嚣张）、"
+    "giveup=摆烂（躺平/放弃）、tease=挑逗（调戏/撩）、hello=你好高兴（打招呼/开心）。"
+    "例如：一句回复结束后换行接 [sticker:cheer]，再写下一句，再接一行 [sticker:shy]；不要输出没有实际句子的标注行。"
 )
 
-# 多轮对话记忆：session_id -> 消息历史列表，单会话最多保留最近 20 条（FIFO 裁剪）
-MEMORY_LIMIT = 20
+def _load_personality() -> str:
+    """加载人格设定：优先读取 WebUI 控制面板保存的 webui_personality.json（两端同步），
+    文件不存在/为空/解析失败时回退内置 SYSTEM_PROMPT。每次调用实时读取，
+    前端保存后 QQ 机器人端无需重启即可生效。"""
+    try:
+        pf = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "webui", "webui_personality.json",
+        )
+        if os.path.exists(pf):
+            with open(pf, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            if text:
+                return text
+    except Exception as e:
+        _safe_print(f"[PERSONALITY] 读取 webui_personality.json 失败，回退内置人格: {e}")
+    return SYSTEM_PROMPT
+
+# 多轮对话记忆：session_id -> 消息历史列表，单会话最多保留最近 60 条（FIFO 裁剪）
+MEMORY_LIMIT = 60
 session_memory: dict[str, list[dict]] = {}
 
-# 表情包库（公网直链，QQ 服务器主动拉取）
-# 每项含 key（供模型标注）、url、情绪含义，发送时按语境匹配
+# ===== 记忆持久化（SQLite）：重启后按会话恢复最近 MEMORY_LIMIT 条上下文 =====
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
+DB_KEEP_MAX = 500        # 每个会话最多保留 500 条记录，超出删除最旧
+DB_KEEP_DAYS = 7         # 只保留近 7 天数据，更早记录自动清理
+_db_lock = threading.Lock()   # sqlite 连接串行化锁（异步 to_thread 写入安全）
+
+
+def _init_db() -> None:
+    """初始化 SQLite 数据库与消息表（幂等，失败静默不影响主流程）。"""
+    try:
+        with _db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_session "
+                "ON messages(session_id, id)"
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        _safe_print(f"[DB] 初始化失败（忽略）: {e}")
+
+
+def _db_load_history(session_id: str) -> list[dict]:
+    """从数据库读取指定会话最近 MEMORY_LIMIT 条消息（按时间正序返回）。"""
+    try:
+        with _db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            rows = conn.execute(
+                "SELECT role, content FROM messages WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, MEMORY_LIMIT),
+            ).fetchall()
+            conn.close()
+        return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+    except Exception as e:
+        _safe_print(f"[DB] 加载历史失败（忽略）: {e}")
+        return []
+
+
+def _db_save_messages(session_id: str, messages: list[dict]) -> None:
+    """把一轮 user/assistant 消息写入数据库，并清理该会话超限/过期记录。"""
+    try:
+        now = datetime.now().isoformat(timespec="seconds")
+        with _db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            conn.executemany(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?, ?, ?, ?)",
+                [(session_id, m["role"], m["content"], now) for m in messages],
+            )
+            # 超限清理：只保留每个会话最近 DB_KEEP_MAX 条
+            conn.execute(
+                "DELETE FROM messages WHERE session_id = ? AND id NOT IN ("
+                "SELECT id FROM messages WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT ?)",
+                (session_id, session_id, DB_KEEP_MAX),
+            )
+            # 过期清理：删除早于近 DB_KEEP_DAYS 天的记录
+            cutoff = (datetime.now() - timedelta(days=DB_KEEP_DAYS)).isoformat(
+                timespec="seconds"
+            )
+            conn.execute(
+                "DELETE FROM messages WHERE session_id = ? AND timestamp < ?",
+                (session_id, cutoff),
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        _safe_print(f"[DB] 写入失败（忽略）: {e}")
+
+# ===== 用户私聊文件处理配置 =====
+FILE_TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
+#   临时目录与 bot.py 同目录的 temp 子目录；下载/解析后立即清理
+FILE_MAX_TEXT_CHARS = 8000   # 注入模型的文件内容上限（超长截断）
+FILE_DOWNLOAD_TIMEOUT = 20   # 下载文件超时（秒）
+# 纯文本可直接读取的扩展名
+FILE_PLAIN_EXT = {".txt", ".md", ".log", ".json", ".yaml", ".yml", ".csv"}
+# 代码/配置文件扩展名：与 FILE_PLAIN_EXT 同属纯文本直读集合（utf-8→gbk→latin-1 兜底）
+FILE_CODE_EXT = {
+    ".py", ".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx", ".vue",
+    ".java", ".kt", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs",
+    ".go", ".rs", ".php", ".rb", ".swift", ".m", ".lua", ".pl",
+    ".sh", ".bash", ".bat", ".cmd", ".ps1",
+    ".html", ".htm", ".css", ".scss", ".less", ".xml",
+    ".sql", ".ini", ".cfg", ".conf", ".properties", ".toml",
+    ".json5", ".gradle", ".env", ".gitignore", ".dockerignore",
+}
+# 需要第三方库解析的扩展名（依赖缺失时自动 pip 安装；仍失败则降级为仅告知文件名）
+FILE_PARSE_EXT = {".pdf", ".docx", ".xlsx", ".xls", ".pptx"}
+# 图片扩展名：用户发图片时应走识图分支（视觉模型），绝不进入文件解析分支
+FILE_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".jfif"}
+# 解析文件所需的第三方依赖（首次加载缺失时自动安装）
+FILE_DEPS = ["pypdf", "python-docx", "openpyxl", "pandas", "xlrd", "python-pptx"]
+
+# 表情包库（本地文件：发送时走官方分片上传，不经图床）
+# 每项含 key（供模型标注）、path（本地绝对路径）、name、情绪含义
+STICKER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stickers")
 STICKERS = [
-    {"key": "angry",  "url": "https://i.imgs.ovh/2026/10/15/c8df5b6100bfd377a4a47abe4e217e46.jpg", "name": "生气怒吼", "mood": "生气、抗议、急切"},
-    {"key": "cheer",  "url": "https://i.imgs.ovh/2026/10/15/f916cbb8054c15225c4af963470cd55f.jpg", "name": "开心比心", "mood": "开心、示爱、友好"},
-    {"key": "pout",   "url": "https://i.imgs.ovh/2026/10/15/b3000559e1e71d9d9d1db52521d1b7b4.jpg", "name": "傲娇鼓脸", "mood": "傲娇、生闷气、傲娇"},
+    {"key": "angry",      "path": os.path.join(STICKER_DIR, "01_愤怒.png"),  "name": "生气怒吼", "mood": "生气、抗议、急切"},
+    {"key": "furious",    "path": os.path.join(STICKER_DIR, "27_生气.png"),  "name": "愤怒咆哮", "mood": "愤怒、暴怒、气炸"},
+    {"key": "cheer",      "path": os.path.join(STICKER_DIR, "02_示爱.png"),  "name": "开心比心", "mood": "开心、示爱、友好"},
+    {"key": "arrogant",   "path": os.path.join(STICKER_DIR, "03_嚣张.jpg"), "name": "嚣张得意", "mood": "嚣张、得意、炫耀"},
+    {"key": "scared",     "path": os.path.join(STICKER_DIR, "04_惊恐.jpg"), "name": "惊恐",     "mood": "惊恐、害怕、慌张"},
+    {"key": "breakdown",  "path": os.path.join(STICKER_DIR, "05_崩溃.jpg"), "name": "崩溃",     "mood": "崩溃、破防、抓狂"},
+    {"key": "crash",      "path": os.path.join(STICKER_DIR, "06_死机.jpg"), "name": "死机",     "mood": "呆滞、死机、懵"},
+    {"key": "speechless", "path": os.path.join(STICKER_DIR, "07_无语.jpg"), "name": "无语",     "mood": "无语、无奈、不想说话"},
+    {"key": "elegant",    "path": os.path.join(STICKER_DIR, "08_优雅.jpg"), "name": "优雅",     "mood": "优雅、从容、端庄"},
+    {"key": "shocked",    "path": os.path.join(STICKER_DIR, "09_震撼.jpg"), "name": "震撼",     "mood": "震撼、惊讶、震惊"},
+    {"key": "cool",       "path": os.path.join(STICKER_DIR, "10_酷飒.png"),  "name": "酷飒",     "mood": "酷飒、帅气、拽"},
+    {"key": "cute",       "path": os.path.join(STICKER_DIR, "11_呆萌.jpg"), "name": "呆萌",     "mood": "呆萌、可爱、犯傻"},
+    {"key": "dazed",      "path": os.path.join(STICKER_DIR, "12_迷离.jpg"), "name": "迷离",     "mood": "迷离、恍惚、出神"},
+    {"key": "summer",     "path": os.path.join(STICKER_DIR, "13_夏日.jpg"), "name": "夏日",     "mood": "夏日、清爽、度假"},
+    {"key": "lazy",       "path": os.path.join(STICKER_DIR, "14_慵懒.jpg"), "name": "慵懒",     "mood": "慵懒、犯困、不想动"},
+    {"key": "shy",        "path": os.path.join(STICKER_DIR, "15_羞涩.jpg"), "name": "羞涩",     "mood": "羞涩、害羞、脸红"},
+    {"key": "nervous",    "path": os.path.join(STICKER_DIR, "16_紧张.jpg"), "name": "紧张",     "mood": "紧张、不安、忐忑"},
+    {"key": "blank",      "path": os.path.join(STICKER_DIR, "17_发呆.jpg"), "name": "发呆",     "mood": "发呆、走神、放空"},
+    {"key": "pout",       "path": os.path.join(STICKER_DIR, "18_卖萌.jpg"),  "name": "傲娇鼓脸", "mood": "傲娇、生闷气、卖萌"},
+    {"key": "gentle",     "path": os.path.join(STICKER_DIR, "19_温柔.jpg"),  "name": "温柔",     "mood": "温柔、宠溺、轻声"},
+    {"key": "serious",    "path": os.path.join(STICKER_DIR, "20_认真.jpg"),  "name": "认真",     "mood": "认真、专注、严肃"},
+    {"key": "curious",    "path": os.path.join(STICKER_DIR, "21_好奇.jpg"),  "name": "好奇",     "mood": "好奇、疑惑、探头"},
+    {"key": "confused",   "path": os.path.join(STICKER_DIR, "22_困惑.jpg"),  "name": "困惑",     "mood": "困惑、迷茫、想不通"},
+    {"key": "provoke",    "path": os.path.join(STICKER_DIR, "23_挑衅.png"),  "name": "挑衅",     "mood": "挑衅、挑事、嚣张"},
+    {"key": "giveup",     "path": os.path.join(STICKER_DIR, "24_摆烂.png"),  "name": "摆烂",     "mood": "摆烂、躺平、放弃"},
+    {"key": "tease",      "path": os.path.join(STICKER_DIR, "25_挑逗.jpg"), "name": "挑逗",     "mood": "挑逗、调戏、撩"},
 ]
 STICKER_BY_KEY = {s["key"]: s for s in STICKERS}
-STICKER_PROB = 0.35  # 回复完成后追加发送表情包的概率（0~1）
+STICKER_PROB = 0.8  # 回复完成后追加发送表情包的概率（0~1）
+
+# ===== 主动消息配置（低频，QQ 官方主动消息约 4 条/月/用户） =====
+PROACTIVE_STORE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "active_users.json"
+)                      # 已记录用户与发送状态持久化文件（与 bot.py 同目录）
+PROACTIVE_INTERVAL_MIN = 10   # 每次发送后随机等待的最小间隔（分钟）
+PROACTIVE_INTERVAL_MAX = 40   # 每次发送后随机等待的最大间隔（分钟）
+PROACTIVE_DAILY_LIMIT = 50    # 每天最多主动消息条数（QQ 官方单聊主动消息每日上限 1000 条/用户）
+PROACTIVE_HOUR_RANGE = (0, 24)  # 全天可发，不设静默时段
+
+# 主动问候场景提示词：让模型知道这是主动发起的问候而非回复
+PROACTIVE_SCENE_PROMPT = (
+    "你现在是主动发起问候的星野猫娘，而不是在回复用户的消息。"
+    "请用星野的风格给 sensei 发一句简短日常问候（30 字以内，1-2 句，带喵～和颜文字，"
+    "可结合当前时间/天气自然问候，如关心有没有好好吃饭、天气冷暖等）。"
+    "不要长篇大论，不要反问多余的问题。"
+)
 
 # 全局处理锁：发送多条回复期间若逻辑上有新消息进入，直接忽略，不处理并发
 _processing_lock = asyncio.Lock()
@@ -120,6 +346,81 @@ def _extract_sticker_key(answer: str) -> tuple[str, str | None]:
     return clean, key
 
 
+def _split_reply_with_stickers(text: str) -> list[tuple[str, str | None]]:
+    """方案 A：按句拆分回复并保留每段的表情包标注。
+
+    模型可在一句结束后换行输出 [sticker:key]；本函数按标注切分文本，
+    把每个合法标注挂到其前面的句子/段落上，再按句拆分，
+    返回 [(段落文本, 表情包key或None), ...]。发送方按顺序发送文本，
+    遇到带 key 的段落紧跟发送对应表情包，实现"表情包按输出内容逐句配发"。
+    """
+    # 1) 按 [sticker:key] 把原文切成 (文本片段, 后置key) 序列；非法 key 记为 None
+    raw: list[tuple[str, str | None]] = []
+    last = 0
+    for m in re.finditer(r"\[sticker:(\w+)\]", text):
+        key = m.group(1)
+        raw.append((text[last:m.start()], None))
+        raw.append((text[m.start():m.end()], key if key in STICKER_BY_KEY else None))
+        last = m.end()
+    raw.append((text[last:], None))
+
+    # 2) 合并：合法标注挂到其前面的文本片段；孤立/非法标注直接丢弃，避免空段与残留
+    parts: list[tuple[str, str | None]] = []
+    for seg, key in raw:
+        if key is not None:
+            if parts and parts[-1][1] is None:
+                prev_text, _ = parts[-1]
+                parts[-1] = (prev_text, key)
+            # 前段已有 key 或前面无文本：丢弃该标注
+        else:
+            s = seg.strip()
+            if not s:
+                continue
+            if s.startswith("[sticker:") and s.endswith("]"):
+                continue  # 非法 key 标注，丢弃
+            parts.append((s, None))
+
+    # 3) 每段文本按句拆分；key 挂在拆分后的最后一个句子（整段文本发完即发对应表情包）
+    out: list[tuple[str, str | None]] = []
+    for seg, key in parts:
+        sentences = _split_reply(seg)
+        for i, s in enumerate(sentences):
+            out.append((s, key if i == len(sentences) - 1 else None))
+    return out
+
+
+def _sanitize_llm_output(answer: str, reasoning: str | None = None) -> str:
+    """清理模型输出中的思考泄漏。
+
+    底层模型实为 qwen3 架构（ollama 中 deepseek-r1:8b），请求携带的 think:false
+    参数未生效，模型每次都会先生成一段英文/中文思考（reasoning），偶发会把思考
+    内容直接混入正文发送（如 "/sticker weather info combine time current moment
+    hello greeting initiate combination blend" 这类孤立英文标签序列）。这里在
+    发送前做兜底清洗：
+    1) 若 reasoning 原文（或其头部片段）混入正文，整体剔除；
+    2) 剔除斜杠开头的英文标签串（/sticker weather info ...）；
+    3) 剔除消息末尾连续 4 个以上小写英文词构成的孤立标签尾巴。
+    """
+    if not answer:
+        return answer
+    # 1) reasoning 混入正文
+    if reasoning:
+        r = reasoning.strip()
+        if len(r) >= 10:
+            if r in answer:
+                answer = answer.replace(r, "")
+            else:
+                head = r[:100].strip()
+                if len(head) >= 10 and head in answer:
+                    answer = answer.replace(head, "")
+    # 2) 斜杠开头的英文标签串：/sticker weather info ...
+    answer = re.sub(r"\s*/(?:[a-z]+(?:\s+[a-z]+){2,})", "", answer)
+    # 3) 消息末尾连续 4+ 小写英文词的孤立标签尾巴（如 "hello greeting initiate combination blend"）
+    answer = re.sub(r"\s+(?:[a-z]+\s+){3,}[a-z]+\s*$", "", answer)
+    answer = re.sub(r"[ \t]+", " ", answer).strip()
+    return answer
+
+
 def _append_history(session_id: str, role: str, content: str):
     """向指定会话追加一条历史消息，超出上限时按先进先出裁剪最旧消息。"""
     history = session_memory.setdefault(session_id, [])
@@ -128,15 +429,62 @@ def _append_history(session_id: str, role: str, content: str):
         del history[: len(history) - MEMORY_LIMIT]
 
 
+def _get_history(session_id: str) -> list[dict]:
+    """获取指定会话的历史消息；内存缺失时从 SQLite 恢复（首次访问时懒加载）。"""
+    if session_id not in session_memory:
+        session_memory[session_id] = _db_load_history(session_id)
+    return session_memory.get(session_id, [])
+
+
+def _load_proactive_state() -> dict:
+    """从同目录 JSON 加载已记录用户与主动消息状态；文件不存在/损坏时返回空状态。"""
+    try:
+        with open(PROACTIVE_STORE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "active_users": [],
+            "last_send_time": None,   # 上次主动消息发送时间（ISO 字符串）
+            "last_send_date": None,   # 上次发送所在日期（YYYY-MM-DD，用于跨日重置计数）
+            "daily_sent": 0,          # 当日主动消息发送计数
+            "last_weather_date": None,  # 上次主动提及天气的日期（YYYY-MM-DD，每日最多一次）
+        }
+
+
+def _save_proactive_state(state: dict) -> None:
+    """保存主动消息状态到同目录 JSON（失败静默，不影响主流程）。"""
+    try:
+        with open(PROACTIVE_STORE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        _safe_print(f"[PROACTIVE] 状态保存失败（忽略）: {e}")
+
+
+def _record_active_user(openid: str) -> None:
+    """记录最近互动过的用户 openid（内存 dict + 持久化 JSON，重启后仍记得）。"""
+    global _proactive_state
+    if not openid:
+        return
+    users = _proactive_state.setdefault("active_users", [])
+    if openid not in users:
+        users.append(openid)
+        _save_proactive_state(_proactive_state)
+        _safe_print(f"[PROACTIVE] 已记录用户 {openid}")
+
+
+# 主动消息状态（进程内唯一，随记录/发送实时更新并持久化）
+_proactive_state = _load_proactive_state()
+
+
 def _fetch_weather() -> str | None:
-    """从 Open-Meteo 拉取当前天气，返回中文天气描述；失败返回 None。
+    """从 Open-Meteo 拉取当前天气（可配置城市坐标），返回中文天气描述；失败返回 None。
 
     Open-Meteo 无需 API key，返回 WMO 天气码，映射为中文描述。
     """
     try:
         url = (
             "https://api.open-meteo.com/v1/forecast"
-            "?latitude=YOUR_LAT&longitude=YOUR_LON"
+            "?latitude=YOUR_LATITUDE&longitude=YOUR_LONGITUDE"
             "&current_weather=true&timezone=Asia%2FShanghai"
         )
         with urllib.request.urlopen(url, timeout=8) as resp:
@@ -155,60 +503,237 @@ def _fetch_weather() -> str | None:
         desc = wmo.get(code, f"天气码{code}")
         return f"当前天气：{desc}，气温 {temp}℃"
     except Exception as e:
-        print(f"[WEATHER] 获取失败（忽略）: {e}")
+        _safe_print(f"[WEATHER] 获取失败（忽略）: {e}")
+        return None
+
+
+_WEATHER_QUERY_KEYS = (
+    "天气", "气温", "温度", "下雨", "下雪", "降温", "升温", "回暖",
+    "保暖", "穿", "冷", "热", "晴", "阴", "雨", "雪", "风", "湿度",
+    "冰雹", "雷雨",
+)
+
+
+def _is_weather_query(text: str) -> bool:
+    """判断用户文本是否为主动询问天气（含天气/气温/冷暖等关键词）。"""
+    if not text:
+        return False
+    return any(k in text for k in _WEATHER_QUERY_KEYS)
+
+
+def _weather_used_today() -> bool:
+    """今日是否已主动提及过天气（按日期字符串判断，跨日自动失效）。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    return _proactive_state.get("last_weather_date") == today
+
+
+def _mark_weather_used_today() -> None:
+    """记录今日已主动提及天气（持久化到 proactive 状态文件）。"""
+    _proactive_state["last_weather_date"] = datetime.now().strftime("%Y-%m-%d")
+    _save_proactive_state(_proactive_state)
+
+
+def _install_file_deps() -> None:
+    """解析文件所需第三方依赖缺失时，用当前解释器 pip 安装（失败静默，不阻断主流程）。"""
+    missing = []
+    for mod in ("pypdf", "docx", "openpyxl", "pandas", "xlrd", "pptx"):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(mod)
+    if not missing:
+        return
+    try:
+        _safe_print(f"[FILE] 安装缺失依赖: {missing}")
+        sub = [sys.executable, "-m", "pip", "install", "--quiet"]
+        sub += [m for m in FILE_DEPS if m]
+        import subprocess
+        subprocess.run(sub, check=True, timeout=600)
+        print("[FILE] 依赖安装完成")
+    except Exception as e:
+        _safe_print(f"[FILE] 依赖安装失败（降级为仅告知文件名）: {e}")
+
+
+def _extract_file_text(path: str) -> str | None:
+    """按扩展名解析本地文件为纯文本；失败返回 None（调用方降级为仅告知文件名）。
+
+    支持：txt/md/log/json/yaml/csv 及代码/配置类扩展名（纯文本直读，utf-8→gbk→latin-1 兜底）、
+    pdf（pypdf）、docx（python-docx）、xlsx（openpyxl）、xls（pandas+xlrd）、
+    pptx（python-pptx）、zip（zipfile 列清单）。
+    返回文本若超长由调用方截断。
+    """
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext in FILE_PLAIN_EXT or ext in FILE_CODE_EXT:
+            for enc in ("utf-8", "gbk", "latin-1"):
+                try:
+                    with open(path, "r", encoding=enc) as f:
+                        return f.read()
+                except UnicodeDecodeError:
+                    continue
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        elif ext == ".pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(path)
+            return "\n".join((p.extract_text() or "") for p in reader.pages)
+        elif ext == ".docx":
+            import docx
+            doc = docx.Document(path)
+            parts = [p.text for p in doc.paragraphs]
+            for tbl in doc.tables:
+                for row in tbl.rows:
+                    parts.append(" | ".join(c.text for c in row.cells))
+            return "\n".join(parts)
+        elif ext == ".xlsx":
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            parts = []
+            for ws in wb.worksheets:
+                parts.append(f"[Sheet: {ws.title}]")
+                for row in ws.iter_rows(values_only=True):
+                    vals = [str(c) if c is not None else "" for c in row]
+                    if any(vals):
+                        parts.append(" | ".join(vals))
+            return "\n".join(parts)
+        elif ext == ".xls":
+            import pandas as pd
+            try:
+                sheets = pd.read_excel(path, sheet_name=None, header=None, engine="xlrd")
+            except Exception:
+                # 兼容旧版 pandas（无 xlrd 引擎自动识别时的兜底）
+                sheets = pd.read_excel(path, sheet_name=None, header=None)
+            parts = []
+            for name, df in sheets.items():
+                parts.append(f"[Sheet: {name}]")
+                parts.append(df.to_string(index=False, header=False))
+            return "\n".join(parts)
+        elif ext == ".pptx":
+            from pptx import Presentation
+            prs = Presentation(path)
+            parts = []
+            for i, slide in enumerate(prs.slides, 1):
+                parts.append(f"[第{i}页]")
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        for para in shape.text_frame.paragraphs:
+                            t = "".join(run.text for run in para.runs).strip()
+                            if t:
+                                parts.append(t)
+            return "\n".join(parts)
+        elif ext == ".zip":
+            with zipfile.ZipFile(path) as zf:
+                infos = zf.infolist()
+                lines = [f"[zip 压缩包，共 {len(infos)} 个条目]"]
+                for info in infos[:200]:
+                    lines.append(f"- {info.filename}（{info.file_size} 字节）")
+                if len(infos) > 200:
+                    lines.append(f"…（其余 {len(infos) - 200} 个条目省略）")
+                return "\n".join(lines)
+        else:
+            return None  # 未知类型交给调用方降级
+    except Exception as e:
+        _safe_print(f"[FILE] 解析 {os.path.basename(path)} 失败: {e}")
         return None
 
 
 class QQBot(botpy.Client):
     async def on_ready(self):
         print(f"[OK] QQ 机器人已连接: {self.robot.name}")
+        # 初始化/校验 SQLite 记忆数据库（幂等，失败静默）
+        _init_db()
+        # 启动后台主动问候循环（低频）
+        asyncio.create_task(self._proactive_loop())
+    async def _fetch_c2c_file_url(self, openid: str, file_uuid: str) -> str | None:
+        """调用官方接口 GET /v2/users/{openid}/files/{file_uuid} 获取用户所发文件的下载直链。
 
-    async def _describe_image(self, image_url: str) -> str:
-        """用视觉模型识别图片/表情包内容，返回中文描述；失败时返回失败说明。
-
-        流程：下载图片 -> base64 -> 调用 Ollama 视觉模型识别。
+        返回可下载的 url；失败返回 None。
         """
         try:
-            req = urllib.request.Request(
-                image_url, headers={"User-Agent": "Mozilla/5.0"}
+            route = Route(
+                "GET", "/v2/users/{openid}/files/{file_uuid}",
+                openid=openid, file_uuid=file_uuid,
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                img_bytes = resp.read()
-            if not img_bytes:
-                return "（图片下载为空）"
-            b64 = base64.b64encode(img_bytes).decode("utf-8")
-            resp = llm.chat.completions.create(
-                model=VISION_MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{b64}"
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": (
-                                    "用中文简短描述这张图片：画面里是什么角色/表情/动作，"
-                                    "表达什么情绪或含义（如图片是表情包，请说明它表达的情绪）。"
-                                    "50字以内。"
-                                ),
-                            },
-                        ],
-                    }
-                ],
-                max_tokens=300,
-                timeout=60,
-            )
-            return resp.choices[0].message.content or "（模型未返回描述）"
+            resp = await self.api._http.request(route)
+            url = (resp or {}).get("url")
+            return url or None
         except Exception as e:
-            return f"（图片识别失败：{e}）"
+            _safe_print(f"[FILE] 获取文件下载地址失败: {e}")
+            return None
 
-    async def _ask_llm(self, session_id: str, text: str) -> str:
-        history = session_memory.get(session_id, [])
+    async def _process_user_file(self, message) -> str:
+        """处理私聊文件消息：检测字段 -> 下载到 temp -> 按扩展名解析 -> 拼注入文本 -> 清理。
+
+        返回注入模型的文本片段；任一步失败都降级为仅告知文件名，不阻断回复。
+        """
+        file_name = getattr(message, "file_name", None) or ""
+        file_uuid = getattr(message, "file_uuid", None)
+        openid = message.author.user_openid
+        if not file_name and file_uuid:
+            file_name = f"文件_{file_uuid[:8]}"
+        if not file_name:
+            return ""
+
+        # 依赖缺失时先补装一次（异步子进程，静默）
+        _install_file_deps()
+
+        ext = os.path.splitext(file_name)[1].lower()
+        # 图片消息绝不进入文件解析分支（图片由 _prepare_input 识图分支用视觉模型处理），
+        # 直接返回空字符串，避免"暂不支持解析"降级文案污染模型输入
+        if ext in FILE_IMAGE_EXT:
+            _safe_print(f"[FILE] 图片消息跳过文件解析（交给识图分支）: {file_name}")
+            return ""
+        if (
+            ext not in FILE_PLAIN_EXT
+            and ext not in FILE_CODE_EXT
+            and ext not in FILE_PARSE_EXT
+            and ext != ".zip"
+        ):
+            _safe_print(f"[FILE] 不支持的文件类型: {file_name}（扩展名 {ext or '无'}）")
+            return f"[用户发来文件 {file_name}（该类型暂不支持解析，仅告知文件名）]"
+
+        # 1. 获取下载地址并下载到临时目录
+        if not file_uuid:
+            _safe_print(f"[FILE] 缺少 file_uuid，无法下载: {file_name}")
+            return f"[用户发来文件 {file_name}（缺少下载信息，仅告知文件名）]"
+        url = await self._fetch_c2c_file_url(openid, file_uuid)
+        if not url:
+            return f"[用户发来文件 {file_name}（下载地址获取失败，仅告知文件名）]"
+
+        os.makedirs(FILE_TMP_DIR, exist_ok=True)
+        safe_name = re.sub(r'[\\/:*?"<>|\r\n]+', "_", file_name) or "file"
+        tmp_path = os.path.join(FILE_TMP_DIR, f"{message.id or 'msg'}_{safe_name}")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=FILE_DOWNLOAD_TIMEOUT) as resp:
+                with open(tmp_path, "wb") as f:
+                    f.write(resp.read())
+            _safe_print(f"[FILE] 已下载 {file_name} -> {tmp_path}")
+
+            # 2. 按扩展名解析为纯文本
+            content = _extract_file_text(tmp_path)
+            if not content:
+                return f"[用户发来文件 {file_name}（解析失败，仅告知文件名）]"
+
+            # 3. 超长截断后注入模型
+            if len(content) > FILE_MAX_TEXT_CHARS:
+                content = content[:FILE_MAX_TEXT_CHARS] + "\n…（内容过长已截断）"
+            print(f"[FILE] 解析成功，注入 {len(content)} 字符")
+            return f"[用户发来文件 {file_name}，文件内容：\n{content}]"
+        except Exception as e:
+            _safe_print(f"[FILE] 处理 {file_name} 异常: {e}")
+            return f"[用户发来文件 {file_name}（处理失败：{e}，仅告知文件名）]"
+        finally:
+            # 4. 及时清理临时文件
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                    _safe_print(f"[FILE] 已清理临时文件 {tmp_path}")
+            except Exception as e:
+                _safe_print(f"[FILE] 清理临时文件失败（忽略）: {e}")
+
+    async def _ask_llm(self, session_id: str, text: str, record: bool = True, with_weather: bool = False) -> str:
+        history = _get_history(session_id)
         # 每条请求实时读取电脑本地时间（含年月日、时分、星期），不参与 FIFO 裁剪
         now = datetime.now()
         weekday_cn = "一二三四五六日"[now.weekday()]
@@ -216,10 +741,19 @@ class QQBot(botpy.Client):
             f"当前本地时间是 {now.year}年{now.month}月{now.day}日 "
             f"星期{weekday_cn} {now.hour:02d}:{now.minute:02d}"
         )
-        # 实时天气注入（失败时为 None，不阻断回复）
-        weather_prompt = _fetch_weather()
+        # 实时天气注入规则（普通回复默认不注入）：
+        # 1) 用户主动询问天气（含天气关键词）→ 强制注入，不受每日一次限制；
+        # 2) 主动问候等 with_weather=True → 仅当日首次注入并记录（每日最多一次主动提天气）；
+        # 3) 普通回复 with_weather=False 且非天气询问 → 不注入。
+        weather_prompt = None
+        if _is_weather_query(text):
+            weather_prompt = _fetch_weather()
+        elif with_weather and not _weather_used_today():
+            weather_prompt = _fetch_weather()
+            if weather_prompt:
+                _mark_weather_used_today()
         messages = (
-            [{"role": "system", "content": SYSTEM_PROMPT}]
+            [{"role": "system", "content": _load_personality()}]
             + [{"role": "system", "content": time_prompt}]
             + ([{"role": "system", "content": weather_prompt}] if weather_prompt else [])
             + history
@@ -231,68 +765,257 @@ class QQBot(botpy.Client):
                 messages=messages,
                 max_tokens=1500,
                 timeout=180,
-                extra_body={"num_ctx": 8192, "think": False},
+                extra_body={"num_ctx": 16384, "think": False},
             )
-            answer = resp.choices[0].message.content or "（模型未返回内容）"
+            message = resp.choices[0].message
+            answer = message.content or "（模型未返回内容）"
+            # 清理偶发混入正文的思考内容（qwen3 架构 think:false 未生效）
+            reasoning = getattr(message, "reasoning", None) or ""
+            answer = _sanitize_llm_output(answer, reasoning if reasoning else None)
         except Exception as e:
             return f"（本地模型调用失败：{e}）"
-        # 调用成功后回写本轮对话到历史（避免把失败信息存入记忆）
-        _append_history(session_id, "user", text)
-        _append_history(session_id, "assistant", answer)
+        # 调用成功后回写本轮对话到历史（避免把失败信息存入记忆）；主动问候不写入历史
+        if record:
+            _append_history(session_id, "user", text)
+            _append_history(session_id, "assistant", answer)
+            # 异步持久化本轮 user/assistant 消息到 SQLite（不阻塞回复发送）
+            try:
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        _db_save_messages,
+                        session_id,
+                        [
+                            {"role": "user", "content": text},
+                            {"role": "assistant", "content": answer},
+                        ],
+                    )
+                )
+            except Exception as e:
+                _safe_print(f"[DB] 异步写入任务创建失败（忽略）: {e}")
         return answer
+
+    async def _upload_local_media(self, target: str, is_group: bool, file_path: str, file_type: int = 1) -> dict:
+        """官方分片上传本地文件：upload_prepare → 逐片 PUT → upload_part_finish → files 合并。
+
+        返回 Media dict（file_uuid/file_info/ttl），供 msg_type=7 发送富媒体使用。
+        单聊走 /v2/users/{openid}，群聊走 /v2/groups/{group_openid}，端点互不通用。
+        """
+        with open(file_path, "rb") as f:
+            data = f.read()
+        file_size = len(data)
+        md5 = hashlib.md5(data).hexdigest()
+        sha1 = hashlib.sha1(data).hexdigest()
+        md5_10m = hashlib.md5(data[:10002432]).hexdigest()  # 前 10002432 字节（约 10MB）MD5
+        file_name = os.path.basename(file_path)
+
+        if is_group:
+            prepare_route = Route("POST", "/v2/groups/{group_openid}/upload_prepare", group_openid=target)
+            finish_route = Route("POST", "/v2/groups/{group_openid}/upload_part_finish", group_openid=target)
+            merge_route = Route("POST", "/v2/groups/{group_openid}/files", group_openid=target)
+        else:
+            prepare_route = Route("POST", "/v2/users/{openid}/upload_prepare", openid=target)
+            finish_route = Route("POST", "/v2/users/{openid}/upload_part_finish", openid=target)
+            merge_route = Route("POST", "/v2/users/{openid}/files", openid=target)
+
+        resp = await self.api._http.request(prepare_route, json={
+            "file_type": file_type,
+            "file_size": str(file_size),
+            "file_name": file_name,
+            "md5": md5,
+            "sha1": sha1,
+            "md5_10m": md5_10m,
+        })
+        upload_id = resp["upload_id"]
+        block_size = int(resp["block_size"])
+        parts = resp["parts"]  # [{index, presigned_url, block_size}]
+
+        async with aiohttp.ClientSession() as session:
+            for part in parts:
+                idx = part["index"]  # 官方实际从 1 开始（文档写 0 起）
+                p_url = part["presigned_url"]
+                p_size = int(part.get("block_size") or block_size)
+                start = (idx - 1) * block_size  # index 1 起，偏移需减 1
+                chunk = data[start:start + p_size]
+                async with session.put(p_url, data=chunk) as r:
+                    if r.status not in (200, 201, 204):
+                        raise RuntimeError(f"分片 {idx} PUT 失败: HTTP {r.status}")
+                await self.api._http.request(finish_route, json={
+                    "upload_id": upload_id,
+                    "part_index": idx,
+                    "block_size": str(len(chunk)),
+                    "md5": hashlib.md5(chunk).hexdigest(),
+                })
+
+        merged = await self.api._http.request(merge_route, json={
+            "file_type": file_type,
+            "srv_send_msg": False,
+            "file_name": file_name,
+            "upload_id": upload_id,
+        })
+        return merged
 
     async def _send_sticker(self, target: str, is_group: bool, key: str | None = None):
         """上传并发送一张表情包（独立消息，失败静默，不影响文本回复）。
 
         is_group=True 时 target 为 group_openid，否则为 user_openid。
         key 指定则发送对应情绪的表情包，否则从库中随机选一张。
-        流程：先调用文件上传接口拿到 file_info，再用富媒体(msg_type=7)发出。
+        流程：本地文件（path 字段）走官方分片上传拿到 file_info，再用富媒体(msg_type=7)发出；
+        历史公网直链（url 字段）继续走 botpy 封装的上传接口。
         """
         if key and key in STICKER_BY_KEY:
-            url = STICKER_BY_KEY[key]["url"]
+            item = STICKER_BY_KEY[key]
         else:
-            url = random.choice(STICKERS)["url"]
+            item = random.choice(STICKERS)
         try:
+            path = item.get("path")
+            if path and os.path.isfile(path):
+                media = await self._upload_local_media(target, is_group, path)
+            else:
+                url = item["url"]
+                if is_group:
+                    media = await self.api.post_group_file(
+                        group_openid=target, file_type=1, url=url
+                    )
+                else:
+                    media = await self.api.post_c2c_file(
+                        openid=target, file_type=1, url=url
+                    )
             if is_group:
-                media = await self.api.post_group_file(
-                    group_openid=target, file_type=1, url=url
-                )
                 await self.api.post_group_message(
                     group_openid=target, msg_type=7, media=media, msg_id=None
                 )
             else:
-                media = await self.api.post_c2c_file(
-                    openid=target, file_type=1, url=url
-                )
                 await self.api.post_c2c_message(
                     openid=target, msg_type=7, media=media, msg_id=None
                 )
-            print(f"[STICKER] 已发送 {url}")
+            _safe_print(f"[STICKER] 已发送 {path or url}")
         except Exception as e:
-            print(f"[STICKER] 表情包发送失败（忽略）: {e}")
+            _safe_print(f"[STICKER] 表情包发送失败（忽略）: {e}")
+
+    async def _proactive_greet(self) -> bool:
+        """主动向已记录用户私聊发送一句问候 + 一张表情包（每天最多 PROACTIVE_DAILY_LIMIT 条）。"""
+        users = _proactive_state.get("active_users") or []
+        if not users:
+            print("[PROACTIVE] 暂无已记录的用户 openid，跳过主动问候")
+            return False
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        # 跨日时重置当日发送计数
+        if _proactive_state.get("last_send_date") != today:
+            _proactive_state["last_send_date"] = today
+            _proactive_state["daily_sent"] = 0
+        # 每日限额检查（QQ 官方单聊主动消息每日上限 1000 条/用户，此处按需保守限频）
+        if (_proactive_state.get("daily_sent") or 0) >= PROACTIVE_DAILY_LIMIT:
+            print(f"[PROACTIVE] 今日主动消息已达上限 {PROACTIVE_DAILY_LIMIT} 条，今天不再发送")
+            return False
+        target = random.choice(users)
+        # 用现有 _ask_llm 生成主动问候（人设保持星野风格，record=False 不写入多轮历史）
+        greeting = await self._ask_llm(target, PROACTIVE_SCENE_PROMPT, record=False, with_weather=True)
+        # 提取表情包标注并清理正文中的 [sticker:key] 标记
+        greeting, sticker_key = _extract_sticker_key(greeting)
+        # 模型失败时使用固定兜底文案
+        if greeting.startswith("（本地模型调用失败") or greeting == "（模型未返回内容）":
+            greeting = "sensei～今天也要开开心心的喵～(´,,•ω•,,)♡"
+        try:
+            # 主动消息必须非接力：msg_id 必须为 None
+            await self.api.post_c2c_message(
+                openid=target,
+                msg_type=0,
+                msg_id=None,
+                content=greeting[:2000],
+            )
+            # 附带一张随机表情包（复用现有发送逻辑）
+            if sticker_key:
+                await self._send_sticker(target, is_group=False, key=sticker_key)
+            else:
+                await self._send_sticker(target, is_group=False)
+            # 记录发送时间与当日计数（持久化，重启后继续遵守每日限额）
+            _proactive_state["last_send_time"] = now.isoformat(timespec="seconds")
+            _proactive_state["last_send_date"] = today
+            _proactive_state["daily_sent"] = (_proactive_state.get("daily_sent") or 0) + 1
+            _save_proactive_state(_proactive_state)
+            _safe_print(
+                f"[PROACTIVE] 已主动问候 {target}: {greeting[:40]}... "
+                f"（今日第 {_proactive_state['daily_sent']} 条）"
+            )
+            return True
+        except Exception as e:
+            _safe_print(f"[PROACTIVE] 主动消息发送失败: {e}")
+            return False
+
+    async def _proactive_loop(self) -> None:
+        """后台主动问候循环：每次发送后随机等待一个间隔再触发下一次，发送时间完全随机不定时。
+
+        流程：随机等待 [PROACTIVE_INTERVAL_MIN, PROACTIVE_INTERVAL_MAX] 分钟 -> 触发问候
+        -> 再随机等待下一个间隔，如此循环；全天可发不设静默时段。
+        """
+        while True:
+            # 随机等待下一次触发间隔（分钟 -> 秒）
+            wait_minutes = random.randint(PROACTIVE_INTERVAL_MIN, PROACTIVE_INTERVAL_MAX)
+            await asyncio.sleep(wait_minutes * 60)
+            try:
+                # 触发主动问候（内部校验每日限额；无用户/超限会跳过）
+                await self._proactive_greet()
+            except Exception as e:
+                _safe_print(f"[PROACTIVE] 主动问候异常（忽略）: {e}")
 
     async def _prepare_input(self, message) -> str:
-        """根据消息内容生成给模型的输入文本：若带图片/表情包附件，先识别并附上描述。"""
+        """根据消息内容生成给模型的输入文本：
+
+        - 若带图片/表情包附件，先识别并附上描述；识别通道：attachments.url 优先，
+          file_uuid 兜底（QQ 图片也可能以文件消息 msg_type=3 上报、attachments 为空）；
+        - 若是文件消息（msg_type=3，file_uuid 等字段存在），下载并解析内容注入；
+          （图片扩展名不进入文件解析分支，避免降级文案污染模型输入）
+        - 文件处理失败时降级为仅告知文件名，不阻断回复。
+        """
         text = message.content or ""
-        for att in getattr(message, "attachments", []) or []:
-            url = getattr(att, "url", None)
-            if url:
-                desc = await self._describe_image(url)
-                text = f"[用户发来一张图片，识别结果：{desc}] {text}".strip()
+        msg_type = getattr(message, "msg_type", None)
+        attachments = getattr(message, "attachments", []) or []
+        file_uuid = getattr(message, "file_uuid", None)
+        file_name = getattr(message, "file_name", None) or ""
+        att_urls = [getattr(a, "url", None) for a in attachments if getattr(a, "url", None)]
+        ext = os.path.splitext(file_name)[1].lower()
+        _safe_print(
+            f"[FILE-DEBUG] msg_type={msg_type} attachments={len(attachments)} "
+            f"att_urls={att_urls} file_uuid={file_uuid} file_name={file_name}"
+        )
+
+        # ---- 分支判定：文件消息 vs 图片消息 ----
+        # QQ 文件消息（msg_type=3）的 attachments 可能携带封面缩略图 url，
+        # 缩略图识图易失败并产生"[用户发来一张图片，识别结果：（图片识别失败...）]"
+        # 污染模型输入。因此带 file_uuid/file_name 且扩展名非图片的文件消息
+        # 一律跳过封面识图，优先走 _process_user_file 内容解析。
+        has_file = bool(file_uuid or file_name)
+        is_image_ext = bool(ext and ext in FILE_IMAGE_EXT)
+        if has_file and not is_image_ext:
+            # 文档/代码/压缩包等文件消息：跳过封面缩略图识图，直接解析文件内容
+            print("[FILE-DEBUG] 文档/代码文件消息（跳过封面识图，走文件解析）")
+            file_part = await self._process_user_file(message)
+            if file_part:
+                text = f"{file_part} {text}".strip()
+        elif is_image_ext or att_urls:
+            # 纯图片消息：识别模型已下线，仅告知收到图片，不注入识图结果
+            print("[FILE-DEBUG] 图片消息（无识图模型，仅保留原文本）")
+            if is_image_ext:
+                text = f"[用户发来一张图片] {text}".strip()
+        else:
+            print("[FILE-DEBUG] 纯文本消息（无文件字段，直接使用原文）")
         return text
 
     async def on_c2c_message_create(self, message: C2CMessage):
+        # 记录最近互动过的用户 openid（供主动问候使用，持久化到同目录 JSON）
+        _record_active_user(message.author.user_openid)
         # 私聊消息：处理中忽略并发新消息，只回复最新一问
         if _processing_lock.locked():
             print("[C2C] 正在处理上一条回复，忽略新消息")
             return
         async with _processing_lock:
-            print(f"[C2C] {message.author.user_openid}: {message.content}")
+            _safe_print(f"[C2C] {message.author.user_openid}: {message.content}")
             text = await self._prepare_input(message)
             answer = await self._ask_llm(message.author.user_openid, text)
-            answer, sticker_key = _extract_sticker_key(answer)
-            segments = _split_reply(answer)
-            for i, seg in enumerate(segments):
+            # 方案 A：按句拆分并保留每段的表情包标注，逐句配发对应表情包
+            segments = _split_reply_with_stickers(answer)
+            for i, (seg, sticker_key) in enumerate(segments):
                 if i > 0:
                     await asyncio.sleep(1.5)  # 段落间 1.5 秒间隔，避免触发风控
                 # 第一段用原 msg_id 接力回复；后续段落不带 msg_id（同一 msg_id 只能回复一次，
@@ -303,12 +1026,12 @@ class QQBot(botpy.Client):
                     msg_id=message.id if i == 0 else None,
                     content=seg[:2000],
                 )
-                print(f"[C2C-REPLY] seg{i + 1}/{len(segments)}: {seg[:60]}...")
-            # 模型标注了情绪 key 则按语义发送对应表情包；否则按概率随机追加
-            if sticker_key:
-                await self._send_sticker(message.author.user_openid, is_group=False, key=sticker_key)
-            elif random.random() < STICKER_PROB:
-                await self._send_sticker(message.author.user_openid, is_group=False)
+                _safe_print(f"[C2C-REPLY] seg{i + 1}/{len(segments)}: {seg[:60]}...")
+                # 该句带标注则按语义发对应表情包；无标注按概率随机追加
+                if sticker_key:
+                    await self._send_sticker(message.author.user_openid, is_group=False, key=sticker_key)
+                elif random.random() < STICKER_PROB:
+                    await self._send_sticker(message.author.user_openid, is_group=False)
 
     async def on_group_at_message_create(self, message: GroupMessage):
         # 群聊 @ 消息：处理中忽略并发新消息，只回复最新一问
@@ -316,12 +1039,12 @@ class QQBot(botpy.Client):
             print("[GROUP] 正在处理上一条回复，忽略新消息")
             return
         async with _processing_lock:
-            print(f"[GROUP] {message.group_openid}: {message.content}")
+            _safe_print(f"[GROUP] {message.group_openid}: {message.content}")
             text = await self._prepare_input(message)
             answer = await self._ask_llm(message.group_openid, text)
-            answer, sticker_key = _extract_sticker_key(answer)
-            segments = _split_reply(answer)
-            for i, seg in enumerate(segments):
+            # 方案 A：按句拆分并保留每段的表情包标注，逐句配发对应表情包
+            segments = _split_reply_with_stickers(answer)
+            for i, (seg, sticker_key) in enumerate(segments):
                 if i > 0:
                     await asyncio.sleep(1.5)  # 段落间 1.5 秒间隔，避免触发风控
                 # 第一段用原 msg_id 接力回复；后续段落不带 msg_id（同一 msg_id 只能回复一次，
@@ -332,12 +1055,12 @@ class QQBot(botpy.Client):
                     msg_id=message.id if i == 0 else None,
                     content=seg[:2000],
                 )
-                print(f"[GROUP-REPLY] seg{i + 1}/{len(segments)}: {seg[:60]}...")
-            # 模型标注了情绪 key 则按语义发送对应表情包；否则按概率随机追加
-            if sticker_key:
-                await self._send_sticker(message.group_openid, is_group=True, key=sticker_key)
-            elif random.random() < STICKER_PROB:
-                await self._send_sticker(message.group_openid, is_group=True)
+                _safe_print(f"[GROUP-REPLY] seg{i + 1}/{len(segments)}: {seg[:60]}...")
+                # 该句带标注则按语义发对应表情包；无标注按概率随机追加
+                if sticker_key:
+                    await self._send_sticker(message.group_openid, is_group=True, key=sticker_key)
+                elif random.random() < STICKER_PROB:
+                    await self._send_sticker(message.group_openid, is_group=True)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>星野猫娘 · 控制台</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+:root {
+  --bg:#0e1117; --panel:#161b26; --panel2:#1d2432; --line:#2a3242;
+  --txt:#e6e9ef; --dim:#8b93a5; --accent:#7c9cff; --accent2:#a78bfa;
+  --ok:#34d399; --err:#f87171; --warn:#fbbf24; --radius:12px;
+}
+body { background:var(--bg); color:var(--txt); font-family:"Microsoft YaHei","PingFang SC",sans-serif; min-height:100vh; }
+header { display:flex; align-items:center; gap:14px; padding:14px 24px; background:var(--panel); border-bottom:1px solid var(--line); }
+header .logo { width:42px; height:42px; border-radius:50%; background:linear-gradient(135deg,var(--accent),var(--accent2)); display:flex; align-items:center; justify-content:center; font-size:20px; overflow:hidden; }
+header .logo img { width:100%; height:100%; object-fit:cover; border-radius:50%; }
+header h1 { font-size:18px; font-weight:600; }
+header .badge { font-size:12px; color:var(--dim); background:var(--panel2); padding:4px 10px; border-radius:20px; }
+header .status-pill { margin-left:auto; font-size:13px; padding:6px 14px; border-radius:20px; background:var(--panel2); }
+.dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:1px; }
+.dot.on { background:var(--ok); box-shadow:0 0 6px var(--ok); }
+.dot.off { background:var(--err); }
+nav.tabs { display:flex; gap:4px; padding:10px 24px 0; background:var(--panel); border-bottom:1px solid var(--line); }
+nav.tabs button { background:none; border:none; color:var(--dim); font-size:14px; padding:10px 18px; cursor:pointer; border-bottom:2px solid transparent; transition:.15s; }
+nav.tabs button.active { color:var(--txt); border-bottom-color:var(--accent); }
+main { max-width:1100px; margin:0 auto; padding:24px; }
+.tab { display:none; } .tab.active { display:block; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:18px; margin-bottom:16px; }
+.card h3 { font-size:15px; margin-bottom:12px; color:var(--txt); }
+.btn { background:var(--panel2); color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px 16px; font-size:13px; cursor:pointer; transition:.15s; }
+.btn:hover { border-color:var(--accent); color:var(--accent); }
+.btn.primary { background:var(--accent); border-color:var(--accent); color:#0e1117; font-weight:600; }
+.btn.primary:hover { filter:brightness(1.1); }
+.btn.danger { background:rgba(248,113,113,.12); border-color:var(--err); color:var(--err); }
+.btn.danger:hover { background:var(--err); color:#fff; }
+.btn:disabled { opacity:.5; cursor:not-allowed; }
+
+/* 聊天页 */
+.chat-wrap { display:flex; flex-direction:column; height:calc(100vh - 190px); min-height:480px; }
+.chat-box { flex:1; overflow-y:auto; padding:16px 12px; background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); display:flex; flex-direction:column; gap:10px; }
+.msg { max-width:78%; padding:10px 14px; border-radius:14px; line-height:1.6; font-size:14px; white-space:pre-wrap; word-break:break-word; }
+.msg.user { align-self:flex-end; background:var(--accent); color:#0e1117; border-bottom-right-radius:4px; }
+.msg.bot { align-self:flex-start; background:var(--panel2); border-bottom-left-radius:4px; }
+.msg.err { align-self:flex-start; background:rgba(248,113,113,.12); color:var(--err); }
+.chat-input { display:flex; gap:10px; margin-top:12px; }
+.chat-input input { flex:1; background:var(--panel); border:1px solid var(--line); border-radius:10px; color:var(--txt); padding:12px 16px; font-size:14px; outline:none; }
+.chat-input input:focus { border-color:var(--accent); }
+.chat-input .btn { padding:12px 22px; }
+
+/* 状态页 */
+.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+@media (max-width:800px){ .grid2{grid-template-columns:1fr;} }
+.stat-item { display:flex; justify-content:space-between; padding:10px 0; border-bottom:1px dashed var(--line); font-size:14px; }
+.stat-item:last-child { border-bottom:none; }
+.stat-item .k { color:var(--dim); }
+.log-view { background:#0a0d12; border:1px solid var(--line); border-radius:8px; padding:12px; font-family:Consolas,monospace; font-size:12px; color:#9aa4b5; height:320px; overflow-y:auto; white-space:pre-wrap; word-break:break-all; }
+.log-bar { display:flex; gap:8px; margin-bottom:10px; align-items:center; }
+.log-bar .btn { padding:5px 12px; font-size:12px; }
+.log-bar .sel { background:var(--panel2); color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:5px 10px; font-size:12px; }
+
+/* 控制页 */
+.ctl-row { display:flex; gap:10px; flex-wrap:wrap; }
+.switch { display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-size:14px; user-select:none; }
+.switch input { display:none; }
+.switch .track { width:40px; height:22px; background:var(--line); border-radius:20px; position:relative; transition:.2s; }
+.switch .track::after { content:""; width:18px; height:18px; border-radius:50%; background:#fff; position:absolute; top:2px; left:2px; transition:.2s; }
+.switch input:checked + .track { background:var(--ok); }
+.switch input:checked + .track::after { left:20px; }
+.session-list { max-height:260px; overflow-y:auto; }
+.sess-item { display:flex; justify-content:space-between; align-items:center; padding:8px 10px; border-bottom:1px dashed var(--line); font-size:13px; }
+.sess-item .sid { font-family:Consolas,monospace; color:var(--accent); word-break:break-all; }
+.sess-item .meta { color:var(--dim); font-size:12px; }
+.sess-detail { margin-top:10px; border-top:1px solid var(--line); padding-top:10px; }
+.sess-detail .row { display:flex; gap:8px; margin:4px 0; font-size:13px; }
+.sess-detail .role { min-width:56px; font-weight:600; }
+.sess-detail .role.u { color:var(--accent); } .sess-detail .role.a { color:var(--accent2); }
+
+/* 展示页 */
+.about-hero { text-align:center; padding:30px 0 16px; }
+.about-hero .big-avatar { width:88px; height:88px; border-radius:50%; background:linear-gradient(135deg,var(--accent),var(--accent2)); display:flex; align-items:center; justify-content:center; font-size:40px; margin:0 auto 14px; overflow:hidden; }
+.about-hero .big-avatar img { width:100%; height:100%; object-fit:cover; border-radius:50%; }
+.about-hero h2 { font-size:24px; margin-bottom:6px; }
+.about-hero p { color:var(--dim); font-size:14px; }
+.feat-list { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+@media (max-width:800px){ .feat-list{grid-template-columns:1fr;} }
+.feat { background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:12px 14px; font-size:13px; }
+.feat b { color:var(--accent); display:block; margin-bottom:4px; }
+.footer { text-align:center; color:var(--dim); font-size:12px; padding:16px 0 30px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"><img src="avatar.jpg" alt="头像"></div>
+  <h1>星野猫娘 · 控制台</h1>
+  <span class="badge">v1.0.4bat</span>
+  <div class="status-pill" id="headStatus"><span class="dot off"></span>连接中…</div>
+</header>
+<nav class="tabs">
+  <button data-tab="chat" class="active">💬 聊天</button>
+  <button data-tab="status">📊 状态与日志</button>
+  <button data-tab="control">🎛 控制面板</button>
+  <button data-tab="about">🌸 关于</button>
+</nav>
+<main>
+
+<!-- 聊天 -->
+<div class="tab active" id="tab-chat">
+  <div class="chat-wrap">
+    <div class="chat-box" id="chatBox"></div>
+    <div class="chat-input">
+      <input id="chatInput" placeholder="对星野说点什么…（Enter 发送）" autocomplete="off">
+      <button class="btn primary" id="sendBtn">发送</button>
+    </div>
+  </div>
+</div>
+
+<!-- 状态与日志 -->
+<div class="tab" id="tab-status">
+  <div class="grid2">
+    <div class="card">
+      <h3>运行状态</h3>
+      <div class="stat-item"><span class="k">机器人进程</span><span id="stBot">-</span></div>
+      <div class="stat-item"><span class="k">进程 PID</span><span id="stPid">-</span></div>
+      <div class="stat-item"><span class="k">启动时间</span><span id="stStart">-</span></div>
+      <div class="stat-item"><span class="k">本地模型</span><span id="stModel">-</span></div>
+      <div class="stat-item"><span class="k">Ollama 服务</span><span id="stOllama">-</span></div>
+      <div class="stat-item"><span class="k">聊天注入天气</span><span id="stWeather">-</span></div>
+      <div class="stat-item"><span class="k">服务器时间</span><span id="stTime">-</span></div>
+    </div>
+    <div class="card">
+      <h3>日志</h3>
+      <div class="log-bar">
+        <select class="sel" id="logKind">
+          <option value="out">输出日志</option>
+          <option value="err">错误日志</option>
+        </select>
+        <button class="btn" id="refreshLog">刷新</button>
+        <button class="btn" id="autoLog">自动刷新：开</button>
+      </div>
+      <div class="log-view" id="logView">加载中…</div>
+    </div>
+  </div>
+</div>
+
+<!-- 控制面板 -->
+<div class="tab" id="tab-control">
+  <div class="card">
+    <h3>进程控制</h3>
+    <div class="ctl-row">
+      <button class="btn primary" id="btnStart">启动机器人</button>
+      <button class="btn danger" id="btnStop">停止机器人</button>
+      <button class="btn" id="btnRefresh">刷新状态</button>
+    </div>
+    <p style="color:var(--dim);font-size:12px;margin-top:10px;">停止会结束所有 bot.py 进程（含后台子进程），启动约需 8 秒连接 QQ。</p>
+  </div>
+  <div class="card">
+    <h3>聊天配置</h3>
+    <label class="switch">
+      <input type="checkbox" id="swWeather">
+      <span class="track"></span>
+      <span>前端聊天注入实时天气（不修改 bot.py 行为）</span>
+    </label>
+  </div>
+  <div class="card">
+    <h3>记忆管理</h3>
+    <div class="ctl-row">
+      <button class="btn" id="btnClearWebui">清空前端聊天记忆</button>
+      <button class="btn danger" id="btnClearAll">清空全部会话记忆</button>
+    </div>
+    <p style="color:var(--dim);font-size:12px;margin-top:10px;">清空全部会影响 QQ 机器人记忆，请谨慎。</p>
+    <div class="session-list" id="sessionList" style="margin-top:12px;"></div>
+    <div class="sess-detail" id="sessionDetail"></div>
+  </div>
+  <div class="card">
+    <h3>人格设定（永久记忆）</h3>
+    <textarea id="personalityText" rows="10" style="width:100%;background:var(--panel);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:10px;font-size:13px;resize:vertical;outline:none;" placeholder="编辑星野猫娘的人格设定..."></textarea>
+    <div class="ctl-row" style="margin-top:8px;">
+      <button class="btn primary" id="btnSavePersonality">保存人格设定</button>
+      <span id="personalityStatus" style="color:var(--dim);font-size:12px;margin-left:8px;"></span>
+    </div>
+    <p style="color:var(--dim);font-size:12px;margin-top:10px;">保存后前端聊天与 QQ 机器人端同步生效（机器人每次回复实时读取），无需重启。</p>
+  </div>
+</div>
+
+<!-- 关于 -->
+<div class="tab" id="tab-about">
+  <div class="card">
+    <div class="about-hero">
+      <div class="big-avatar"><img src="avatar.jpg" alt="头像"></div>
+      <h2>星野猫娘</h2>
+      <p>来自蔚蓝档案（Blue Archive）的猫娘形态 · 专属 sensei 的 AI 助手</p>
+    </div>
+  </div>
+  <div class="card">
+    <h3>功能清单</h3>
+    <div class="feat-list">
+      <div class="feat"><b>💬 本地对话</b>基于 Ollama 运行 deepseek-r1:8b，全程本地推理，支持多轮记忆（60 条）。</div>
+      <div class="feat"><b>🧠 记忆持久化</b>对话历史写入 SQLite，重启后仍能记住最近会话。</div>
+      <div class="feat"><b>⏰ 时间感知</b>每条回复注入实时本地时间，星野知道现在是几点。</div>
+      <div class="feat"><b>🌦 天气感知</b>聊天可注入本地实时天气（可在控制面板关闭）。</div>
+      <div class="feat"><b>📄 文件读取</b>QQ 端支持解析 txt/pdf/docx/xlsx/pptx 等文件并作答。</div>
+      <div class="feat"><b>👀 云端识图</b>QQ 端图片走智谱 GLM-4V-Flash 免费视觉识别。</div>
+      <div class="feat"><b>😺 表情包</b>25 种本地表情包按语义自动匹配输出。</div>
+      <div class="feat"><b>🎈 主动问候</b>随机时间主动找 sensei 聊天，每天最多 3 次，天气一天最多一次。</div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>使用说明</h3>
+    <p style="font-size:14px;line-height:1.9;color:var(--dim);">
+      聊天页与 QQ 机器人共用同一人格与模型，但会话独立（webui），不会污染 QQ 侧记忆。<br>
+      状态页可查看机器人进程与实时日志；控制面板可启停进程、管理记忆与天气注入。<br>
+      后端：FastAPI @ 127.0.0.1:8888，复用 QQ 机器人环境与 bot.db。
+    </p>
+  </div>
+</div>
+
+</main>
+<div class="footer">星野猫娘 Web 前端 · v1.0.4bat · 本地运行</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let autoLogTimer = null;
+let autoLogOn = true;
+
+/* Tab 切换 */
+document.querySelectorAll('nav.tabs button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('nav.tabs button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    $('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'status') refreshStatus();
+    if (btn.dataset.tab === 'control') refreshSessions();
+  });
+});
+
+/* 头部状态 */
+async function refreshHead() {
+  try {
+    const r = await fetch('/api/status'); const d = await r.json();
+    const el = $('headStatus');
+    if (d.bot_running) { el.innerHTML = '<span class="dot on"></span>机器人在线 · ' + (d.bot_count||1) + ' 进程'; }
+    else { el.innerHTML = '<span class="dot off"></span>机器人未运行'; }
+    $('stBot').innerHTML = d.bot_running ? '<span style="color:var(--ok)">运行中</span>' : '<span style="color:var(--err)">未运行</span>';
+    $('stPid').textContent = d.bot_pid || '-';
+    $('stStart').textContent = d.bot_started || '-';
+    $('stModel').textContent = d.model || '-';
+    $('stOllama').innerHTML = d.ollama_ok ? '<span style="color:var(--ok)">在线</span>' : '<span style="color:var(--err)">离线</span>';
+    $('stWeather').textContent = d.weather_in_chat ? '开启' : '关闭';
+    $('stTime').textContent = d.server_time || '-';
+  } catch (e) { $('headStatus').innerHTML = '<span class="dot off"></span>服务不可达'; }
+}
+
+/* 状态页 */
+async function refreshStatus() {
+  await refreshHead();
+  await refreshLog();
+}
+
+/* 日志 */
+async function refreshLog() {
+  const kind = $('logKind').value;
+  try {
+    const r = await fetch('/api/logs?kind=' + kind + '&lines=200'); const d = await r.json();
+    $('logView').textContent = d.ok ? (d.lines.join('\n') || '（暂无日志）') : ('错误：' + (d.error||''));
+    $('logView').scrollTop = $('logView').scrollHeight;
+  } catch (e) { $('logView').textContent = '加载失败'; }
+}
+$('refreshLog').onclick = refreshLog;
+$('logKind').onchange = refreshLog;
+$('autoLog').onclick = () => { autoLogOn = !autoLogOn; $('autoLog').textContent = '自动刷新：' + (autoLogOn ? '开' : '关'); };
+setInterval(() => { if (autoLogOn && document.querySelector('nav.tabs button[data-tab="status"]').classList.contains('active')) refreshLog(); }, 5000);
+
+/* 聊天 */
+const chatBox = $('chatBox');
+function addMsg(role, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + (role === 'user' ? 'user' : role === 'err' ? 'err' : 'bot');
+  div.textContent = text;
+  chatBox.appendChild(div);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
+function greeting() {
+  addMsg('bot', '喵～sensei 来啦 (｡･ω･｡) 我是星野，随时可以找我聊天哦～');
+}
+async function send() {
+  const input = $('chatInput');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  addMsg('user', text);
+  addMsg('bot', '（思考中喵…）');
+  try {
+    const r = await fetch('/api/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:text}) });
+    const d = await r.json();
+    const last = chatBox.lastElementChild;
+    if (d.ok) { last.textContent = d.reply; }
+    else { last.className = 'msg err'; last.textContent = '出错喵：' + (d.error||''); }
+  } catch (e) {
+    const last = chatBox.lastElementChild;
+    last.className = 'msg err'; last.textContent = '无法连接后端服务喵：' + e;
+  }
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
+$('sendBtn').onclick = send;
+$('chatInput').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+if (!chatBox.children.length) greeting();
+
+/* 控制面板 */
+async function refreshSessions() {
+  try {
+    const r = await fetch('/api/sessions'); const d = await r.json();
+    const box = $('sessionList');
+    box.innerHTML = '<h3 style="margin-bottom:8px;">数据库会话</h3>';
+    if (!d.ok || !d.sessions.length) { box.innerHTML += '<div style="color:var(--dim);font-size:13px;">（暂无会话）</div>'; return; }
+    d.sessions.forEach(s => {
+      const item = document.createElement('div');
+      item.className = 'sess-item';
+      item.innerHTML = '<span class="sid">' + s.session_id + '</span><span class="meta">' + s.count + ' 条 · ' + (s.last||'').slice(0,16) + '</span>';
+      item.onclick = () => viewSession(s.session_id);
+      box.appendChild(item);
+    });
+  } catch (e) {}
+}
+async function viewSession(sid) {
+  try {
+    const r = await fetch('/api/session/' + encodeURIComponent(sid)); const d = await r.json();
+    const box = $('sessionDetail');
+    if (!d.ok) { box.innerHTML = '读取失败'; return; }
+    box.innerHTML = '<div class="row" style="justify-content:space-between"><b>会话：' + sid + '</b><button class="btn" onclick="document.getElementById(\'sessionDetail\').innerHTML=\'\'">收起</button></div>';
+    d.messages.slice(-20).forEach(m => {
+      box.innerHTML += '<div class="row"><span class="role ' + (m.role==='user'?'u':'a') + '">' + (m.role==='user'?'用户':'星野') + '</span><span>' + m.content.slice(0,200) + '</span></div>';
+    });
+  } catch (e) {}
+}
+$('btnRefresh').onclick = async () => { await refreshHead(); await refreshSessions(); };
+$('btnStart').onclick = async () => {
+  $('btnStart').disabled = true; $('btnStart').textContent = '启动中…';
+  try { const r = await fetch('/api/bot/start', {method:'POST'}); const d = await r.json(); alert(d.msg||'已启动'); }
+  catch(e){ alert('请求失败'); }
+  $('btnStart').disabled = false; $('btnStart').textContent = '启动机器人';
+  setTimeout(refreshHead, 2000);
+};
+$('btnStop').onclick = async () => {
+  if (!confirm('确定要停止所有 bot.py 进程吗？')) return;
+  try { const r = await fetch('/api/bot/stop', {method:'POST'}); const d = await r.json(); alert(d.msg||'已停止'); }
+  catch(e){ alert('请求失败'); }
+  setTimeout(refreshHead, 1500);
+};
+$('btnClearWebui').onclick = async () => {
+  if (!confirm('清空前端聊天（webui）的记忆？')) return;
+  const r = await fetch('/api/memory/clear?session_id=webui', {method:'POST'}); const d = await r.json();
+  alert(d.msg || d.error || '完成');
+  chatBox.innerHTML = ''; greeting(); refreshSessions();
+};
+$('btnClearAll').onclick = async () => {
+  if (!confirm('危险操作：将清空全部会话记忆（含 QQ 机器人记忆），确定？')) return;
+  if (!confirm('再次确认：真的要清空全部吗？')) return;
+  const r = await fetch('/api/memory/clear?all_sessions=true', {method:'POST'}); const d = await r.json();
+  alert(d.msg || d.error || '完成');
+  chatBox.innerHTML = ''; greeting(); refreshSessions();
+};
+
+/* 天气开关 */
+async function loadWeatherCfg() {
+  try { const r = await fetch('/api/config'); const d = await r.json(); $('swWeather').checked = d.ok && d.config.weather_in_chat; } catch(e) {}
+}
+$('swWeather').addEventListener('change', async () => {
+  const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({weather_in_chat:$('swWeather').checked})});
+  const d = await r.json();
+  alert(d.ok ? '天气注入已' + (d.config.weather_in_chat ? '开启' : '关闭') : '保存失败');
+  refreshHead();
+});
+
+/* 人格设定 */
+async function loadPersonality() {
+  try {
+    const r = await fetch('/api/personality'); const d = await r.json();
+    if (d.ok) $('personalityText').value = d.personality;
+  } catch(e) {}
+}
+$('btnSavePersonality').onclick = async () => {
+  const text = $('personalityText').value;
+  if (!text.trim()) { alert('人格文本不能为空'); return; }
+  $('personalityStatus').textContent = '保存中...';
+  try {
+    const r = await fetch('/api/personality', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({personality:text})});
+    const d = await r.json();
+    $('personalityStatus').textContent = d.ok ? '已保存 ✓' : '保存失败: ' + (d.error||'');
+    $('personalityStatus').style.color = d.ok ? 'var(--ok)' : 'var(--err)';
+  } catch(e) { $('personalityStatus').textContent = '请求失败'; $('personalityStatus').style.color = 'var(--err)'; }
+};
+
+/* 面板切换时加载人格 */
+document.querySelectorAll('nav.tabs button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('nav.tabs button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    $('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'status') refreshStatus();
+    if (btn.dataset.tab === 'control') { refreshSessions(); loadPersonality(); }
+  });
+});
+
+/* 启动 */
+refreshHead();
+loadWeatherCfg();
+setInterval(refreshHead, 10000);
+</script>
+</body>
+</html>
